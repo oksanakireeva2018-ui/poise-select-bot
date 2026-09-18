@@ -1,4 +1,8 @@
 import os
+import io
+import time
+import base64
+import random
 import json
 import logging
 from datetime import time as dtime
@@ -20,7 +24,9 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 YANDEX_API_KEY = os.environ["YANDEX_API_KEY"]
 YANDEX_FOLDER_ID = os.environ["YANDEX_FOLDER_ID"]
 
-YANDEX_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
+YANDEX_TEXT_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
+YANDEX_IMAGE_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/imageGenerationAsync"
+YANDEX_OPERATION_URL = "https://llm.api.cloud.yandex.net/operations/{op_id}"
 
 STATE_FILE = "state.json"
 ARCHIVE_FILE = "approved_drafts.log"
@@ -79,6 +85,7 @@ def load_state():
         "schedule_hour": None,
         "schedule_minute": None,
         "topic_index": 0,
+        "num_images": 3,
     }
 
 
@@ -118,10 +125,73 @@ def generate_draft(topic: str, feedback: str = None) -> str:
         ],
     }
 
-    resp = requests.post(YANDEX_URL, headers=headers, json=body, timeout=60)
+    resp = requests.post(YANDEX_TEXT_URL, headers=headers, json=body, timeout=60)
     resp.raise_for_status()
     data = resp.json()
     return data["result"]["alternatives"][0]["message"]["text"]
+
+
+def extract_visual_idea(draft_text: str) -> str:
+    marker = "Идея визуала:"
+    idx = draft_text.find(marker)
+    if idx == -1:
+        # fallback — общий бренд-стиль, если модель не выдала блок в нужном формате
+        return (
+            "Интерьерная фотография в стиле editorial: тёплый кремовый, dusty pink, "
+            "burgundy, olive, дерево, латунь, солнечный свет и мягкие тени"
+        )
+    idea = draft_text[idx + len(marker):].strip()
+    return idea[:500]
+
+
+def generate_image(prompt: str) -> bytes:
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Api-Key {YANDEX_API_KEY}",
+    }
+    body = {
+        "modelUri": f"art://{YANDEX_FOLDER_ID}/yandex-art/latest",
+        "generationOptions": {
+            "seed": str(random.randint(0, 1_000_000)),
+            "aspectRatio": {"widthRatio": "1", "heightRatio": "1"},
+        },
+        "messages": [{"weight": "1", "text": prompt}],
+    }
+
+    create_resp = requests.post(YANDEX_IMAGE_URL, headers=headers, json=body, timeout=30)
+    create_resp.raise_for_status()
+    op_id = create_resp.json()["id"]
+
+    for _ in range(24):  # до ~2 минут ожидания
+        time.sleep(5)
+        op_resp = requests.get(YANDEX_OPERATION_URL.format(op_id=op_id), headers=headers, timeout=30)
+        op_resp.raise_for_status()
+        data = op_resp.json()
+        if data.get("done"):
+            if "error" in data:
+                raise RuntimeError(data["error"])
+            image_b64 = data["response"]["image"]
+            return base64.b64decode(image_b64)
+
+    raise TimeoutError("изображение не успело сгенерироваться за отведённое время")
+
+
+async def send_draft(bot, chat_id: int, text: str, prefix: str = ""):
+    await bot.send_message(chat_id=chat_id, text=f"{prefix}{text}\n\n—\nУтверждаем или правим?")
+    idea = extract_visual_idea(text)
+    count = state.get("num_images", 3)
+    sent = 0
+    for _ in range(count):
+        try:
+            image_bytes = generate_image(idea)
+            await bot.send_photo(chat_id=chat_id, photo=io.BytesIO(image_bytes))
+            sent += 1
+        except Exception as e:
+            logger.exception("Ошибка генерации изображения")
+    if sent == 0:
+        await bot.send_message(chat_id=chat_id, text="Текст готов, но ни одну картинку сгенерировать не получилось.")
+    elif sent < count:
+        await bot.send_message(chat_id=chat_id, text=f"Сгенерировала {sent} из {count} картинок — часть не получилась.")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -130,7 +200,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Готово, я на связи. Я — редактор POISE SELECT.\n\n"
         "Команды:\n"
-        "/new тема — подготовить черновик публикации (без темы — возьму дежурную)\n"
+        "/new тема — подготовить черновик публикации и картинки (без темы — возьму дежурную)\n"
+        "/images N — сколько картинок присылать на черновик (сейчас: 3, максимум 5)\n"
         "/schedule ЧЧ:ММ — присылать черновик каждый день в это время (по времени сервера)\n"
         "/stop_schedule — выключить ежедневную рассылку\n\n"
         "После черновика просто напиши:\n"
@@ -142,17 +213,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def new_draft(update: Update, context: ContextTypes.DEFAULT_TYPE):
     topic = " ".join(context.args) if context.args else DEFAULT_TOPICS[state["topic_index"] % len(DEFAULT_TOPICS)]
-    await update.message.reply_text("Готовлю черновик…")
+    await update.message.reply_text("Готовлю черновик и картинку…")
     try:
         text = generate_draft(topic)
     except Exception as e:
-        logger.exception("Ошибка генерации")
+        logger.exception("Ошибка генерации текста")
         await update.message.reply_text(f"Не получилось получить черновик: {e}")
         return
     state["pending_draft"] = text
     state["last_topic"] = topic
     save_state(state)
-    await update.message.reply_text(f"{text}\n\n—\nУтверждаем или правим?")
+    await send_draft(context.bot, update.effective_chat.id, text)
 
 
 async def scheduled_job(context: ContextTypes.DEFAULT_TYPE):
@@ -169,10 +240,7 @@ async def scheduled_job(context: ContextTypes.DEFAULT_TYPE):
     state["pending_draft"] = text
     state["last_topic"] = topic
     save_state(state)
-    await context.bot.send_message(
-        chat_id=state["chat_id"],
-        text=f"Дежурный черновик на сегодня.\n\n{text}\n\n—\nУтверждаем или правим?",
-    )
+    await send_draft(context.bot, state["chat_id"], text, prefix="Дежурный черновик на сегодня.\n\n")
 
 
 async def schedule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -189,6 +257,16 @@ async def schedule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state["schedule_hour"], state["schedule_minute"] = hh, mm
     save_state(state)
     await update.message.reply_text(f"Готово. Черновик буду присылать каждый день в {hh:02d}:{mm:02d} (время сервера).")
+
+
+async def images_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text(f"Формат: /images 3 (сейчас: {state.get('num_images', 3)})")
+        return
+    n = max(1, min(int(context.args[0]), 5))
+    state["num_images"] = n
+    save_state(state)
+    await update.message.reply_text(f"Готово. Буду присылать {n} картинки(у) на каждый черновик.")
 
 
 async def stop_schedule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -219,7 +297,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_state(state)
         await update.message.reply_text("Черновик отклонён.")
     else:
-        await update.message.reply_text("Вношу правки…")
+        await update.message.reply_text("Вношу правки и пересобираю картинку…")
         try:
             text = generate_draft(state["last_topic"], feedback=update.message.text)
         except Exception as e:
@@ -228,7 +306,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         state["pending_draft"] = text
         save_state(state)
-        await update.message.reply_text(f"{text}\n\n—\nУтверждаем или правим?")
+        await send_draft(context.bot, update.effective_chat.id, text)
 
 
 def main():
@@ -238,6 +316,7 @@ def main():
     app.add_handler(CommandHandler("new", new_draft))
     app.add_handler(CommandHandler("schedule", schedule_cmd))
     app.add_handler(CommandHandler("stop_schedule", stop_schedule_cmd))
+    app.add_handler(CommandHandler("images", images_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     if state.get("chat_id") and state.get("schedule_hour") is not None:
