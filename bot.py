@@ -3,7 +3,7 @@ import json
 import logging
 from datetime import time as dtime
 
-from anthropic import Anthropic
+import requests
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -17,11 +17,13 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("poise-select-bot")
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+YANDEX_API_KEY = os.environ["YANDEX_API_KEY"]
+YANDEX_FOLDER_ID = os.environ["YANDEX_FOLDER_ID"]
+
+YANDEX_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
+
 STATE_FILE = "state.json"
 ARCHIVE_FILE = "approved_drafts.log"
-
-client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
 BRAND_PROMPT = """Ты — редактор канала POISE SELECT (Яндекс Дзен, дом и интерьер).
 
@@ -98,13 +100,28 @@ def generate_draft(topic: str, feedback: str = None) -> str:
     else:
         user_msg = f"Подготовь готовую публикацию на тему: {topic}"
 
-    resp = client.messages.create(
-        model="claude-sonnet-5",
-        max_tokens=1500,
-        system=BRAND_PROMPT,
-        messages=[{"role": "user", "content": user_msg}],
-    )
-    return resp.content[0].text
+    headers = {
+        "Authorization": f"Api-Key {YANDEX_API_KEY}",
+        "x-folder-id": YANDEX_FOLDER_ID,
+        "Content-Type": "application/json",
+    }
+    body = {
+        "modelUri": f"gpt://{YANDEX_FOLDER_ID}/yandexgpt/latest",
+        "completionOptions": {
+            "stream": False,
+            "temperature": 0.6,
+            "maxTokens": "2000",
+        },
+        "messages": [
+            {"role": "system", "text": BRAND_PROMPT},
+            {"role": "user", "text": user_msg},
+        ],
+    }
+
+    resp = requests.post(YANDEX_URL, headers=headers, json=body, timeout=60)
+    resp.raise_for_status()
+    data = resp.json()
+    return data["result"]["alternatives"][0]["message"]["text"]
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -126,7 +143,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def new_draft(update: Update, context: ContextTypes.DEFAULT_TYPE):
     topic = " ".join(context.args) if context.args else DEFAULT_TOPICS[state["topic_index"] % len(DEFAULT_TOPICS)]
     await update.message.reply_text("Готовлю черновик…")
-    text = generate_draft(topic)
+    try:
+        text = generate_draft(topic)
+    except Exception as e:
+        logger.exception("Ошибка генерации")
+        await update.message.reply_text(f"Не получилось получить черновик: {e}")
+        return
     state["pending_draft"] = text
     state["last_topic"] = topic
     save_state(state)
@@ -138,7 +160,12 @@ async def scheduled_job(context: ContextTypes.DEFAULT_TYPE):
         return
     topic = DEFAULT_TOPICS[state["topic_index"] % len(DEFAULT_TOPICS)]
     state["topic_index"] += 1
-    text = generate_draft(topic)
+    try:
+        text = generate_draft(topic)
+    except Exception as e:
+        logger.exception("Ошибка генерации по расписанию")
+        await context.bot.send_message(chat_id=state["chat_id"], text=f"Не получилось подготовить дежурный черновик: {e}")
+        return
     state["pending_draft"] = text
     state["last_topic"] = topic
     save_state(state)
@@ -193,7 +220,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Черновик отклонён.")
     else:
         await update.message.reply_text("Вношу правки…")
-        text = generate_draft(state["last_topic"], feedback=update.message.text)
+        try:
+            text = generate_draft(state["last_topic"], feedback=update.message.text)
+        except Exception as e:
+            logger.exception("Ошибка генерации правок")
+            await update.message.reply_text(f"Не получилось внести правки: {e}")
+            return
         state["pending_draft"] = text
         save_state(state)
         await update.message.reply_text(f"{text}\n\n—\nУтверждаем или правим?")
